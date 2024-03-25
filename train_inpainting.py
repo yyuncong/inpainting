@@ -49,7 +49,7 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    StableDiffusionInstructPix2PixPipeline,
+    StableDiffusionInpaintPipeline,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
@@ -58,6 +58,7 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from egoexo_dataset import EgoExoDataset
+from utils import render_forward_splat, get_camera_params
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -430,8 +431,11 @@ def parse_args():
     return args
 
 
-def convert_to_np(image, resolution):
-    image = image.convert("RGB").resize((resolution, resolution))
+# def convert_to_np(image, resolution):
+#     image = image.convert("RGB").resize((resolution, resolution))
+#     return np.array(image).transpose(2, 0, 1)
+def convert_to_np(image):
+    image = image.convert("RGB")
     return np.array(image).transpose(2, 0, 1)
 
 
@@ -543,8 +547,8 @@ def main():
     # then fine-tuned on the custom InstructPix2Pix dataset. This modified UNet is initialized
     # from the pre-trained checkpoints. For the extra channels added to the first layer, they are
     # initialized to zero.
-    logger.info("Initializing the InstructPix2Pix UNet from the pretrained UNet.")
-    in_channels = 12
+    logger.info("Initializing the Inpainting UNet from the pretrained UNet.")
+    in_channels = 13
     out_channels = unet.conv_in.out_channels
     unet.register_to_config(in_channels=in_channels)
 
@@ -557,7 +561,7 @@ def main():
             unet.conv_in.padding,
         )
         new_conv_in.weight.zero_()
-        new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        new_conv_in.weight[:, :9, :, :].copy_(unet.conv_in.weight)
         unet.conv_in = new_conv_in
 
     # Freeze vae and text_encoder
@@ -710,37 +714,52 @@ def main():
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
+            transforms.Resize(args.resolution),
             (
                 transforms.CenterCrop(args.resolution)
                 if args.center_crop
                 else transforms.RandomCrop(args.resolution)
             ),
-            (
-                transforms.RandomHorizontalFlip()
-                if args.random_flip
-                else transforms.Lambda(lambda x: x)
-            ),
+            # (
+            #     transforms.RandomHorizontalFlip()
+            #     if args.random_flip
+            #     else transforms.Lambda(lambda x: x)
+            # ),
         ]
     )
 
     def preprocess_images(examples):
-        input_pose_images = convert_to_np(examples["input_pose_image"], args.resolution)
-        input_timestep_images = convert_to_np(
-            examples["input_timestep_image"], args.resolution
-        )
-        edited_images = convert_to_np(examples["edited_image"], args.resolution)
+        input_pose_images = convert_to_np(examples["input_pose_image"])
+        input_timestep_images = convert_to_np(examples["input_timestep_image"])
+        edited_images = convert_to_np(examples["edited_image"])
+        input_pose_depth_images = examples["input_pose_depth"][None,]
         # We need to ensure that the original and the edited images undergo the same
         # augmentation transforms.
         images = np.concatenate(
-            [input_pose_images, input_timestep_images, edited_images]
+            [
+                input_pose_images,
+                input_timestep_images,
+                edited_images,
+                input_pose_depth_images,
+            ],
         )
         images = torch.tensor(images)
-        images = 2 * (images / 255) - 1
-        return train_transforms(images)
+        preprocessed = train_transforms(images)
+
+        preprocessed_images = preprocessed[:-1]
+        preprocessed_images = 2 * (preprocessed_images / 255) - 1
+
+        preprocessed_depth = preprocessed[-1:]
+
+        # visualizer
+        # tensor_to_pil_rgb = transforms.ToPILImage(mode="RGB")
+        # tensor_to_pil_rgb(preprocessed_images[:3].cpu() / 2 + 0.5).show()
+
+        return preprocessed_images, preprocessed_depth
 
     def preprocess_train(examples):
         # Preprocess images.
-        preprocessed_images = preprocess_images(examples)
+        preprocessed_images, preprocessed_depth = preprocess_images(examples)
         # Since the original and edited images were concatenated before
         # applying the transformations, we need to separate them and reshape
         # them accordingly.
@@ -755,13 +774,36 @@ def main():
         )
         edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
 
+        # clip all the images to [-1, 1]
+        input_pose_images = torch.clamp(input_pose_images, -1, 1)
+        input_timestep_images = torch.clamp(input_timestep_images, -1, 1)
+        edited_images = torch.clamp(edited_images, -1, 1)
+
+        depth_images = preprocessed_depth.reshape(args.resolution, args.resolution)
+
         # Collate the preprocessed images into the `examples`.
         examples["input_pose_pixel_values"] = input_pose_images
+        examples["depth_pixel_values"] = depth_images
         examples["input_timestep_pixel_values"] = input_timestep_images
         examples["edited_pixel_values"] = edited_images
+        examples["input_pose_extrinsics"] = torch.tensor(
+            examples["input_pose_extrinsics"]
+        )
+        examples["input_pose_intrinsics"] = torch.tensor(
+            examples["input_pose_intrinsics"]
+        )
+        examples["input_timestep_extrinsics"] = torch.tensor(
+            examples["input_timestep_extrinsics"]
+        )
+        examples["input_timestep_intrinsics"] = torch.tensor(
+            examples["input_timestep_intrinsics"]
+        )
 
         # Preprocess the captions.
-        captions = ["" for _ in range(len(examples["input_pose_pixel_values"]))]
+        captions = [
+            "as photorealistic as possible"
+            for _ in range(len(examples["input_pose_pixel_values"]))
+        ]
         examples["input_ids"] = tokenize_captions(captions)
         return examples
 
@@ -793,6 +835,26 @@ def main():
         edited_pixel_values = edited_pixel_values.to(
             memory_format=torch.contiguous_format
         ).float()
+
+        depth_pixel_values = torch.stack(
+            [example["depth_pixel_values"] for example in examples]
+        )
+        depth_pixel_values = depth_pixel_values.to(
+            memory_format=torch.contiguous_format
+        ).float()
+        source_intrinsics = torch.stack(
+            [example["input_pose_intrinsics"] for example in examples]
+        )
+        source_extrinsics = torch.stack(
+            [example["input_pose_extrinsics"] for example in examples]
+        )
+        target_intrinsics = torch.stack(
+            [example["input_timestep_intrinsics"] for example in examples]
+        )
+        target_extrinsics = torch.stack(
+            [example["input_timestep_extrinsics"] for example in examples]
+        )
+
         input_ids = torch.stack([example["input_ids"] for example in examples])
 
         original_pixel_values = torch.cat(
@@ -801,7 +863,12 @@ def main():
 
         return {
             "original_pixel_values": original_pixel_values,
+            "depth_pixel_values": depth_pixel_values,
             "edited_pixel_values": edited_pixel_values,
+            "source_intrinsics": source_intrinsics,
+            "source_extrinsics": source_extrinsics,
+            "target_intrinsics": target_intrinsics,
+            "target_extrinsics": target_extrinsics,
             "input_ids": input_ids,
         }
 
@@ -941,6 +1008,32 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
+
+                source_intrinsics = batch["source_intrinsics"].to(weight_dtype)
+                source_extrinsics = batch["source_extrinsics"].to(weight_dtype)
+                target_intrinsics = batch["target_intrinsics"].to(weight_dtype)
+                target_extrinsics = batch["target_extrinsics"].to(weight_dtype)
+
+                R_source, T_source, K_source = get_camera_params(
+                    source_extrinsics, source_intrinsics, args.resolution
+                )
+                R_target, T_target, K_target = get_camera_params(
+                    target_extrinsics, target_intrinsics, args.resolution
+                )
+                warp_feature, warp_disp, warp_mask = render_forward_splat(
+                    batch["original_pixel_values"][:, 0] / 2 + 0.5,
+                    batch["depth_pixel_values"],
+                    R_source.to(torch.float32),
+                    T_source.to(torch.float32),
+                    K_source.to(torch.float32),
+                    R_target.to(torch.float32),
+                    T_target.to(torch.float32),
+                    K_target.to(torch.float32),
+                )
+                tensor_to_pil_rgb = transforms.ToPILImage(mode="RGB")
+                # tensor_to_pil_rgb(warp_feature[0].cpu()).show()
+                batch["original_pixel_values"][:, 0] = warp_feature * 2 - 1
+
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
@@ -982,6 +1075,14 @@ def main():
                     bsz, -1, feature_size, feature_size
                 )
 
+                # Initialize an all one mask with the same size as original_pixel_values
+                mask = (1 - warp_mask).to(weight_dtype)
+                # mask = torch.ones_like(batch["original_pixel_values"][:, :, 0, :, :])
+                mask = torch.nn.functional.interpolate(
+                    mask, size=(feature_size, feature_size)
+                )
+                mask = mask.to(device=original_image_embeds.device)
+
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
                 if args.conditioning_dropout_prob is not None:
@@ -1015,7 +1116,13 @@ def main():
 
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
                 concatenated_noisy_latents = torch.cat(
-                    [noisy_latents, original_image_embeds], dim=1
+                    [
+                        noisy_latents,
+                        original_image_embeds[:, :1],
+                        mask,
+                        original_image_embeds[:, 1:],
+                    ],
+                    dim=1,
                 )
 
                 # Get the target for loss depending on the prediction type
@@ -1114,7 +1221,7 @@ def main():
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
                 # The models need unwrapping because for compatibility in distributed training mode.
-                pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                pipeline = StableDiffusionInpaintPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     unet=unwrap_model(unet),
                     text_encoder=unwrap_model(text_encoder),
@@ -1126,78 +1233,80 @@ def main():
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
 
-                def my_prepare_image_latents(
-                    image,
+                def prepare_mask_latents(
+                    self,
+                    mask,
+                    masked_image,
                     batch_size,
-                    num_images_per_prompt,
+                    height,
+                    width,
                     dtype,
                     device,
+                    generator,
                     do_classifier_free_guidance,
-                    generator=None,
                 ):
-                    if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
-                        raise ValueError(
-                            f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
-                        )
+                    # resize the mask to latents shape as we concatenate the mask to the latents
+                    # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+                    # and half precision
+                    mask = torch.nn.functional.interpolate(
+                        mask,
+                        size=(
+                            height // self.vae_scale_factor,
+                            width // self.vae_scale_factor,
+                        ),
+                    )
+                    mask = mask.to(device=device, dtype=dtype)
 
-                    image = image.to(device=device, dtype=dtype)
+                    masked_image = masked_image.to(device=device, dtype=dtype)
 
-                    batch_size = batch_size * num_images_per_prompt
-
-                    if image.shape[1] == 4:
-                        image_latents = image
+                    if masked_image.shape[1] == 4:
+                        masked_image_latents = masked_image
                     else:
                         original_image_embeds = pipeline.vae.encode(
-                            image
+                            masked_image
                         ).latent_dist.mode()
-                        image_latents = original_image_embeds
-                        feature_size = image_latents.shape[-1]
-                        image_latents = image_latents.reshape(
+                        masked_image_latents = original_image_embeds
+                        feature_size = masked_image_latents.shape[-1]
+                        masked_image_latents = masked_image_latents.reshape(
                             1, -1, feature_size, feature_size
                         )
 
-                    if (
-                        batch_size > image_latents.shape[0]
-                        and batch_size % image_latents.shape[0] == 0
-                    ):
-                        # expand image_latents for batch_size
-                        deprecation_message = (
-                            f"You have passed {batch_size} text prompts (`prompt`), but only {image_latents.shape[0]} initial"
-                            " images (`image`). Initial images are now duplicating to match the number of text prompts. Note"
-                            " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
-                            " your script to pass as many initial images as text prompts to suppress this warning."
-                        )
-                        deprecate(
-                            "len(prompt) != len(image)",
-                            "1.0.0",
-                            deprecation_message,
-                            standard_warn=False,
-                        )
-                        additional_image_per_prompt = (
-                            batch_size // image_latents.shape[0]
-                        )
-                        image_latents = torch.cat(
-                            [image_latents] * additional_image_per_prompt, dim=0
-                        )
-                    elif (
-                        batch_size > image_latents.shape[0]
-                        and batch_size % image_latents.shape[0] != 0
-                    ):
-                        raise ValueError(
-                            f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
-                        )
-                    else:
-                        image_latents = torch.cat([image_latents], dim=0)
-
-                    if do_classifier_free_guidance:
-                        uncond_image_latents = torch.zeros_like(image_latents)
-                        image_latents = torch.cat(
-                            [image_latents, image_latents, uncond_image_latents], dim=0
+                    # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+                    if mask.shape[0] < batch_size:
+                        if not batch_size % mask.shape[0] == 0:
+                            raise ValueError(
+                                "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                                f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                                " of masks that you pass is divisible by the total requested batch size."
+                            )
+                        mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+                    if masked_image_latents.shape[0] < batch_size:
+                        if not batch_size % masked_image_latents.shape[0] == 0:
+                            raise ValueError(
+                                "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                                f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                                " Make sure the number of images that you pass is divisible by the total requested batch size."
+                            )
+                        masked_image_latents = masked_image_latents.repeat(
+                            batch_size // masked_image_latents.shape[0], 1, 1, 1
                         )
 
-                    return image_latents
+                    mask = (
+                        torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+                    )
+                    masked_image_latents = (
+                        torch.cat([masked_image_latents] * 2)
+                        if do_classifier_free_guidance
+                        else masked_image_latents
+                    )
 
-                pipeline.prepare_image_latents = my_prepare_image_latents
+                    # aligning device to prevent device errors when concating it with the latent model input
+                    masked_image_latents = masked_image_latents.to(
+                        device=device, dtype=dtype
+                    )
+                    return mask, masked_image_latents
+
+                pipeline.prepare_mask_latents = prepare_mask_latents
 
                 # run inference
                 validation_iter = iter(test_dataloader)
