@@ -1059,7 +1059,8 @@ def main():
                     T_target.to(torch.float32),
                     K_target.to(torch.float32),
                 )
-                batch["original_pixel_values"] = warp_feature.unsqueeze(1)
+                tensor_to_pil_rgb = transforms.ToPILImage(mode="RGB")
+                batch["original_pixel_values"] = warp_feature.unsqueeze(1) * 2 - 1
 
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.

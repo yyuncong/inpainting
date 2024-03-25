@@ -11,16 +11,10 @@ def get_camera_params(extrinsics, intrinsics, resolution):
     h, w, f = intrinsics[:, 1, 2] * 2, intrinsics[:, 0, 2] * 2, intrinsics[:, 0, 0]
     w_scale = resolution / w
     h_scale = resolution / h
-    w = int(w * w_scale)
-    h = int(h * h_scale)
-    f_w = f * w_scale
-    f_h = f * h_scale
-    K = torch.tensor(
-        [[f_w, 0, w / 2], [0, f_h, h / 2], [0, 0, 1]],
-        dtype=torch.float32,
-        device=intrinsics.device,
-    )
-    K = K.unsqueeze(0).repeat(extrinsics.shape[0], 1, 1)
+    # perform element-wise multiplication
+    K = intrinsics.clone()
+    K[:, 0] *= w_scale
+    K[:, 1] *= h_scale
     return R, T, K
 
 
