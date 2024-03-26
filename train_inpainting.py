@@ -992,7 +992,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description("Steps")
-
+    
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -1118,9 +1118,8 @@ def main():
                 concatenated_noisy_latents = torch.cat(
                     [
                         noisy_latents,
-                        original_image_embeds[:, :1],
                         mask,
-                        original_image_embeds[:, 1:],
+                        original_image_embeds,
                     ],
                     dim=1,
                 )
@@ -1234,16 +1233,7 @@ def main():
                 pipeline.set_progress_bar_config(disable=True)
 
                 def prepare_mask_latents(
-                    self,
-                    mask,
-                    masked_image,
-                    batch_size,
-                    height,
-                    width,
-                    dtype,
-                    device,
-                    generator,
-                    do_classifier_free_guidance,
+                    mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
                 ):
                     # resize the mask to latents shape as we concatenate the mask to the latents
                     # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
@@ -1251,8 +1241,8 @@ def main():
                     mask = torch.nn.functional.interpolate(
                         mask,
                         size=(
-                            height // self.vae_scale_factor,
-                            width // self.vae_scale_factor,
+                            height // pipeline.vae_scale_factor,
+                            width // pipeline.vae_scale_factor,
                         ),
                     )
                     mask = mask.to(device=device, dtype=dtype)
@@ -1327,7 +1317,7 @@ def main():
                             batch = next(validation_iter)
 
                         original_image = transforms.ToPILImage(mode="RGB")(
-                            batch["original_pixel_values"]
+                            batch["original_pixel_values"][:, 0]
                             .squeeze()
                             .to(accelerator.device)
                             / 2
@@ -1347,7 +1337,7 @@ def main():
                             target_extrinsics, target_intrinsics, args.resolution
                         )
                         warp_feature, warp_disp, warp_mask = render_forward_splat(
-                            batch["original_pixel_values"].squeeze(1) / 2 + 0.5,
+                            batch["original_pixel_values"][:, 0].squeeze(1) / 2 + 0.5,
                             batch["depth_pixel_values"],
                             R_source.to(torch.float32),
                             T_source.to(torch.float32),
@@ -1357,12 +1347,12 @@ def main():
                             K_target.to(torch.float32),
                         )
                         tensor_to_pil_rgb = transforms.ToPILImage(mode="RGB")
-                        batch["original_pixel_values"] = (
+                        batch["original_pixel_values"][:, 0] = (
                             warp_feature.unsqueeze(1) * 2 - 1
                         )
 
                         transformed_image = transforms.ToPILImage(mode="RGB")(
-                            batch["original_pixel_values"]
+                            batch["original_pixel_values"][:, 0]
                             .squeeze()
                             .to(accelerator.device)
                             / 2
@@ -1370,8 +1360,11 @@ def main():
                         )
                         transformed_images.append(transformed_image)
                         conditioning_image = transforms.ToPILImage(mode="RGB")(
-                            batch["prompt_pixel_values"] / 2
-                            + (0.5).squeeze().to(accelerator.device)
+                            batch["original_pixel_values"][:, 1]
+                            .squeeze()
+                            .to(accelerator.device)
+                            / 2
+                            + 0.5
                         )
                         conditioning_images.append(conditioning_image)
                         gt_image = transforms.ToPILImage(mode="RGB")(
@@ -1403,7 +1396,7 @@ def main():
                                 mask_image=mask_image,
                                 num_inference_steps=50,
                                 # image_guidance_scale=1.5,
-                                # guidance_scale=2.5,
+                                guidance_scale=1.0,
                                 generator=generator,
                             ).images[0]
                         )
