@@ -57,7 +57,13 @@ class EgoExoDataset(torch.utils.data.Dataset):
                 cameras.sort()
                 self.cam_map[take_name] = cameras
                 num_cameras = len(cameras)
-                num_frames = len(os.listdir(os.path.join(take_path, "cam01")))
+                num_frames = len(
+                    [
+                        file_path
+                        for file_path in os.listdir(os.path.join(take_path, "cam01"))
+                        if file_path.endswith(".jpg")
+                    ]
+                )
                 if take_name.split("_")[1] in self.scenario_excluding_list:
                     continue
                 take_list.append((take_name, num_cameras, num_frames))
@@ -115,8 +121,8 @@ class EgoExoDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         # TODO: fix this hardcoding
-        if self.split == "test":
-            self._rng = np.random.default_rng(seed=self.seed)
+        # if self.split == "test":
+        #     self._rng = np.random.default_rng(seed=self.seed)
         take_name, num_cameras, num_frames = self.take_list[index]
         pose_camera_idx = self._rng.integers(num_cameras) + 1
         # timestep_camera_idx = (

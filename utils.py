@@ -13,8 +13,8 @@ def get_camera_params(extrinsics, intrinsics, resolution):
     h_scale = resolution / h
     # perform element-wise multiplication
     K = intrinsics.clone()
-    K[:, 0] *= w_scale
-    K[:, 1] *= h_scale
+    K[:, 0] *= w_scale.unsqueeze(1)
+    K[:, 1] *= h_scale.unsqueeze(1)
     return R, T, K
 
 

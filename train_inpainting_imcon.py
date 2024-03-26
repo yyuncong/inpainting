@@ -575,7 +575,7 @@ def main():
     image_encoder.requires_grad_(False)
 
     unet.down_blocks.requires_grad_(False)
-    unet.mid_block.requires_grad_(False)
+    # unet.mid_block.requires_grad_(False)
     unet.up_blocks.requires_grad_(False)
 
     # for unet_block in unet.down_blocks:
@@ -715,7 +715,7 @@ def main():
         img_size=args.resolution,
         random_split=True,
         subsampling_rate=1.0,
-        train_val_split=0.5,
+        train_val_split=0.6,
     )
 
     test_dataset = EgoExoDataset(
@@ -724,7 +724,7 @@ def main():
         img_size=args.resolution,
         random_split=True,
         subsampling_rate=1.0,
-        train_val_split=0.5,
+        train_val_split=0.6,
     )
 
     # Preprocessing the datasets.
@@ -1107,7 +1107,8 @@ def main():
                 )
 
                 # Initialize an all one mask with the same size as original_pixel_values
-                mask = torch.ones_like(batch["original_pixel_values"][:, :, 0, :, :])
+                mask = (1 - warp_mask).to(weight_dtype)
+                # mask = torch.ones_like(batch["original_pixel_values"][:, :, 0, :, :])
                 mask = torch.nn.functional.interpolate(
                     mask, size=(feature_size, feature_size)
                 )
@@ -1152,7 +1153,7 @@ def main():
 
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
                 concatenated_noisy_latents = torch.cat(
-                    [noisy_latents, original_image_embeds, mask], dim=1
+                    [noisy_latents, mask, original_image_embeds], dim=1
                 )
 
                 # Get the target for loss depending on the prediction type
@@ -1267,21 +1268,69 @@ def main():
                 validation_iter = iter(test_dataloader)
                 edited_images = []
                 gt_images = []
+                conditioning_images = []
+                original_images = []
+                transformed_images = []
                 with torch.autocast(
                     str(accelerator.device).replace(":0", ""),
                     enabled=accelerator.mixed_precision == "fp16",
                 ):
                     for _ in range(
-                        min(len(test_dataloader), args.num_validation_images)
+                        args.num_validation_images
                     ):
-                        batch = next(validation_iter)
-                        original_image = (
+                        try:
+                            batch = next(validation_iter)
+                        except StopIteration:
+                            validation_iter = iter(test_dataloader)
+                            batch = next(validation_iter)
+
+                        original_image = transforms.ToPILImage(mode="RGB")(
                             batch["original_pixel_values"]
-                            .squeeze(0)
+                            .squeeze()
                             .to(accelerator.device)
                             / 2
                             + 0.5
                         )
+                        original_images.append(original_image)
+
+                        source_intrinsics = batch["source_intrinsics"].to(weight_dtype)
+                        source_extrinsics = batch["source_extrinsics"].to(weight_dtype)
+                        target_intrinsics = batch["target_intrinsics"].to(weight_dtype)
+                        target_extrinsics = batch["target_extrinsics"].to(weight_dtype)
+
+                        R_source, T_source, K_source = get_camera_params(
+                            source_extrinsics, source_intrinsics, args.resolution
+                        )
+                        R_target, T_target, K_target = get_camera_params(
+                            target_extrinsics, target_intrinsics, args.resolution
+                        )
+                        warp_feature, warp_disp, warp_mask = render_forward_splat(
+                            batch["original_pixel_values"].squeeze(1) / 2 + 0.5,
+                            batch["depth_pixel_values"],
+                            R_source.to(torch.float32),
+                            T_source.to(torch.float32),
+                            K_source.to(torch.float32),
+                            R_target.to(torch.float32),
+                            T_target.to(torch.float32),
+                            K_target.to(torch.float32),
+                        )
+                        tensor_to_pil_rgb = transforms.ToPILImage(mode="RGB")
+                        batch["original_pixel_values"] = warp_feature.unsqueeze(1) * 2 - 1
+
+                        transformed_image = transforms.ToPILImage(mode="RGB")(
+                            batch["original_pixel_values"]
+                            .squeeze()
+                            .to(accelerator.device)
+                            / 2
+                            + 0.5
+                        )
+                        transformed_images.append(transformed_image)
+                        conditioning_image = transforms.ToPILImage(mode="RGB")(
+                            batch["prompt_pixel_values"]
+                            .squeeze()
+                            .to(accelerator.device)
+                        )
+                        conditioning_images.append(conditioning_image)
                         prompt_embeds = image_encoder(
                             **{
                                 "pixel_values": batch["prompt_pixel_values"].to(
@@ -1296,21 +1345,27 @@ def main():
                             / 2
                             + 0.5
                         )
+                        # mask_image = (
+                        #     torch.ones_like(
+                        #         batch["original_pixel_values"][:, :, 0, :, :]
+                        #     )
+                        #     .to(accelerator.device)
+                        #     .squeeze(0)
+                        # )
                         mask_image = (
-                            torch.ones_like(
-                                batch["original_pixel_values"][:, :, 0, :, :]
-                            )
+                            (1 - warp_mask)
                             .to(accelerator.device)
                             .squeeze(0)
                         )
+                        input_image = batch["original_pixel_values"].squeeze().to(accelerator.device) / 2 + 0.5
                         edited_images.append(
                             pipeline(
                                 prompt_embeds=prompt_embeds,
-                                image=original_image,
+                                image=input_image,
                                 mask_image=mask_image,
                                 num_inference_steps=50,
-                                image_guidance_scale=2.5,
-                                guidance_scale=1.5,
+                                # image_guidance_scale=2.5,
+                                # guidance_scale=1.5,
                                 generator=generator,
                             ).images[0]
                         )
@@ -1336,14 +1391,35 @@ def main():
                     visualization_path, f"epoch_{epoch}"
                 )
                 os.makedirs(epoch_visualization_path, exist_ok=True)
-                for i, (edited_image, gt_image) in enumerate(
-                    zip(edited_images, gt_images)
+                for i, (edited_image, gt_image, conditioning_image, original_image, transformed_image) in enumerate(
+                    zip(
+                        edited_images,
+                        gt_images,
+                        conditioning_images,
+                        original_images,
+                        transformed_images,
+                    )
                 ):
                     edited_image.save(
                         os.path.join(epoch_visualization_path, f"edited_image_{i}.png")
                     )
                     gt_image.save(
                         os.path.join(epoch_visualization_path, f"gt_image_{i}.png")
+                    )
+                    conditioning_image.save(
+                        os.path.join(
+                            epoch_visualization_path, f"conditioning_image_{i}.png"
+                        )
+                    )
+                    original_image.save(
+                        os.path.join(
+                            epoch_visualization_path, f"original_image_{i}.png"
+                        )
+                    )
+                    transformed_image.save(
+                        os.path.join(
+                            epoch_visualization_path, f"transformed_image_{i}.png"
+                        )
                     )
 
                 del pipeline
